@@ -1,0 +1,256 @@
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import DataLoader, Subset
+from torchvision import datasets, transforms
+import numpy as np
+import wandb
+import pandas as pd
+from typing import List, Dict, Any, Tuple
+from collections import OrderedDict
+
+# Hyperparameters
+config = {
+    "batch_size": 128,
+    "num_epochs": 20,
+    "learning_rate": 1e-3,
+    "lambda_reg": 0.1,  # FIM regularization strength
+    "num_clients": 10,
+    "hidden_sizes": [512, 256],
+    "client_epochs": 5,
+    "experiment_name": "federated_learning_ficsr",
+    "fim_memory": 0.9  # Decay factor for FIM accumulation
+}
+
+# Initialize wandb
+wandb.init(project="federated_learning_ficsr", config=config)
+
+# Device configuration
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print(f"Using device: {device}")
+
+class SimpleNN(nn.Module):
+    """Standard neural network with FIM regularization capability"""
+    def __init__(self, input_size=784, hidden_sizes=[512, 256], num_classes=10):
+        super().__init__()
+        self.layers = nn.Sequential(
+            nn.Linear(input_size, hidden_sizes[0]),
+            nn.ReLU(),
+            nn.Linear(hidden_sizes[0], hidden_sizes[1]),
+            nn.ReLU(),
+            nn.Linear(hidden_sizes[1], num_classes)
+        )
+        
+    def forward(self, x):
+        x = x.view(-1, 784)
+        return self.layers(x)
+    
+    def compute_fim(self, x, y, criterion):
+        """Compute Fisher Information Matrix diagonal approximation"""
+        self.zero_grad()
+        outputs = self(x)
+        loss = criterion(outputs, y)
+        loss.backward()
+        
+        # Compute squared gradients as FIM approximation
+        fim = {}
+        for name, param in self.named_parameters():
+            if param.grad is not None:
+                fim[name] = param.grad.pow(2).mean().item()
+        return fim
+
+def create_federated_data(dataset, num_clients: int) -> List[Subset]:
+    """Split dataset for federated learning with class balance"""
+    targets = dataset.targets
+    class_indices = [torch.where(targets == i)[0] for i in range(10)]
+    client_data_indices = [[] for _ in range(num_clients)]
+
+    for class_idx in class_indices:
+        perm = torch.randperm(len(class_idx))
+        class_idx = class_idx[perm]
+        splits = torch.chunk(class_idx, num_clients)
+
+        for client_id, split in enumerate(splits):
+            client_data_indices[client_id].extend(split.tolist())
+
+    return [Subset(dataset, indices) for indices in client_data_indices]
+
+def train_client(model: nn.Module,
+                dataset: Subset,
+                optimizer: optim.Optimizer,
+                criterion: nn.Module,
+                client_id: int,
+                global_epoch: int,
+                global_fim: Dict[str, float]) -> Tuple[Dict[str, torch.Tensor], Dict[str, float]]:
+    """Train a single client's model with FIM regularization"""
+    model.train()
+    data_loader = DataLoader(dataset, batch_size=config['batch_size'],
+                           shuffle=True, drop_last=True)
+    
+    client_fim = {name: 0 for name, _ in model.named_parameters()}
+    num_batches = 0
+
+    for local_epoch in range(config['client_epochs']):
+        epoch_loss = 0.0
+        epoch_fim_penalty = 0.0
+        
+        for batch_idx, (data, target) in enumerate(data_loader):
+            data, target = data.to(device), target.to(device)
+            optimizer.zero_grad()
+
+            # Forward pass
+            outputs = model(data)
+            loss = criterion(outputs, target)
+            
+            # Compute FIM penalty
+            fim_penalty = 0
+            if global_fim:
+                for name, param in model.named_parameters():
+                    if name in global_fim and global_fim[name] > 0:
+                        fim_penalty += (param.pow(2) * global_fim[name]).sum()
+                
+                loss += config['lambda_reg'] * fim_penalty
+
+            loss.backward()
+            optimizer.step()
+
+            # Update client FIM
+            batch_fim = model.compute_fim(data, target, criterion)
+            for name in client_fim:
+                client_fim[name] += batch_fim.get(name, 0)
+            
+            epoch_loss += loss.item()
+            epoch_fim_penalty += fim_penalty.item() if global_fim else 0
+            num_batches += 1
+
+        # Average client FIM
+        for name in client_fim:
+            client_fim[name] /= num_batches
+
+        avg_epoch_loss = epoch_loss / num_batches
+        avg_fim_penalty = epoch_fim_penalty / num_batches
+
+        print(f"Client {client_id+1}/{config['num_clients']}, "
+              f"Epoch {local_epoch+1}/{config['client_epochs']}, "
+              f"Loss: {avg_epoch_loss:.4f}, FIM Penalty: {avg_fim_penalty:.4f}")
+
+    return model.state_dict(), client_fim
+
+def aggregate_models(client_states: List[Dict[str, torch.Tensor]]) -> Dict[str, torch.Tensor]:
+    """Implement FedAvg with weighted averaging"""
+    aggregated_state = OrderedDict()
+    
+    for key in client_states[0][0].keys():  # client_states now returns (state_dict, fim)
+        stacked_weights = torch.stack([state[0][key] for state in client_states])
+        aggregated_state[key] = torch.mean(stacked_weights, dim=0)
+    
+    return aggregated_state
+
+def aggregate_fim(client_fims: List[Dict[str, float]]) -> Dict[str, float]:
+    """Aggregate FIM from clients with memory decay"""
+    aggregated_fim = {name: 0 for name in client_fims[0].keys()}
+    
+    for client_fim in client_fims:
+        for name in aggregated_fim:
+            aggregated_fim[name] += client_fim[name]
+    
+    # Average and apply memory decay
+    for name in aggregated_fim:
+        aggregated_fim[name] = aggregated_fim[name] / len(client_fims)
+    
+    return aggregated_fim
+
+def evaluate(model: nn.Module, data_loader: DataLoader, criterion: nn.Module) -> Tuple[float, float]:
+    """Evaluate model performance"""
+    model.eval()
+    total_loss = 0
+    correct = 0
+    total = 0
+    
+    with torch.no_grad():
+        for data, target in data_loader:
+            data, target = data.to(device), target.to(device)
+            outputs = model(data)
+            loss = criterion(outputs, target)
+            
+            total_loss += loss.item()
+            pred = outputs.argmax(dim=1, keepdim=True)
+            correct += pred.eq(target.view_as(pred)).sum().item()
+            total += target.size(0)
+    
+    avg_loss = total_loss / len(data_loader)
+    accuracy = correct / total
+    
+    return avg_loss, accuracy
+
+def main():
+    # Data loading and preprocessing
+    transform = transforms.Compose([
+        transforms.ToTensor(),
+        transforms.Normalize((0.2860,), (0.3530,))  # FashionMNIST normalization
+    ])
+
+    fashion_mnist_train = datasets.FashionMNIST(root='./data', train=True, download=True, transform=transform)
+    fashion_mnist_test = datasets.FashionMNIST(root='./data', train=False, download=True, transform=transform)
+
+    # Initialize model and optimizer
+    model = SimpleNN(hidden_sizes=config['hidden_sizes']).to(device)
+    criterion = nn.CrossEntropyLoss()
+
+    client_datasets = create_federated_data(fashion_mnist_train, config['num_clients'])
+    test_loader = DataLoader(fashion_mnist_test, batch_size=config['batch_size'], shuffle=False)
+
+    wandb.watch(model)
+
+    # Global FIM memory
+    global_fim = {}
+
+    # Training loop
+    for epoch in range(config['num_epochs']):
+        print(f"\nGlobal Epoch {epoch+1}/{config['num_epochs']}")
+
+        client_states = []
+        client_fims = []
+        
+        for client_id, client_dataset in enumerate(client_datasets):
+            optimizer = optim.Adam(model.parameters(), lr=config['learning_rate'])
+            
+            client_state, client_fim = train_client(
+                model, client_dataset, optimizer, criterion,
+                client_id, epoch, global_fim
+            )
+            client_states.append((client_state, client_fim))
+            client_fims.append(client_fim)
+
+        # Aggregate models and FIM
+        global_state = aggregate_models(client_states)
+        model.load_state_dict(global_state)
+        
+        # Update global FIM with memory decay
+        new_global_fim = aggregate_fim(client_fims)
+        if global_fim:
+            for name in global_fim:
+                global_fim[name] = (config['fim_memory'] * global_fim[name] + 
+                                   (1 - config['fim_memory']) * new_global_fim[name])
+        else:
+            global_fim = new_global_fim
+
+        # Evaluation
+        test_loss, test_accuracy = evaluate(model, test_loader, criterion)
+        print(f"Global Epoch {epoch+1}: "
+              f"Test Loss: {test_loss:.4f}, "
+              f"Test Accuracy: {test_accuracy*100:.2f}%")
+
+        wandb.log({
+            "epoch": epoch,
+            "test_loss": test_loss,
+            "test_accuracy": test_accuracy,
+            **{f"fim_{name}": val for name, val in global_fim.items()}
+        })
+
+    # Save final model
+    torch.save(model.state_dict(), "final_model_ficsr.pth")
+    wandb.save("final_model_ficsr.pth")
+
+if __name__ == "__main__":
+    main()
